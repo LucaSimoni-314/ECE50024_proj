@@ -1,155 +1,85 @@
-import torch
-import pandas as pd
-import itertools
-import argparse
-import matplotlib.pyplot as plt
+import os
 import numpy as np
+import time
+from multiprocessing import Pool
 from scipy.linalg import toeplitz
-from multiprocessing import Pool, cpu_count
-from code import solve_task # Ensure this accepts (A, x_true, alpha, c, lr, iters, ...)
-from pathlib import Path
-from tqdm import tqdm
+from worker import runner
+from tqdm import tqdm  # Import tqdm
+# --- Config ---
+N, K = 10, 3
+ALPHA_VALS = [1.0, 10.0, 25.0, 50.0]
+C_VALS = [0.2, 0.5, 0.8]
+OPTIMIZERS = ["Gradient Descent", "Projected GD", "Nesterov", "Stochastic GD", "L-BFGS", "HyperGD"]
+LR_VALS = [0.05, 0.01, 0.005, 0.001]
+TOTAL_TRIALS = 5000
+BATCH_SIZE = 1000
+MAX_ITERS = 4000
+MASTER_SEED = 43
 
-def get_gaussian_toeplitz(n, sigma=50):
-    """
-    Generates convolution matrix A following the user's implementation image logic.
-    """
-    # Create kernel centered around N/2
-    x_axis = np.arange(-n // 2, n // 2)
-    kernel = np.exp(-(x_axis**2) / (2 * sigma**2))
-    
-    # Normalization (optional, but standard in implementation)
-    kernel /= kernel.sum() 
+def generate_A(N, K):
+    half = K // 2
+    x = np.arange(K) - half
+    kernel = np.exp(-x**2 / (2 * (K/4)**2))
+    kernel /= kernel.sum()
+    column = np.zeros(N)
+    column[:K] = kernel[::-1]
+    row = np.zeros(N)
+    row[0] = column[0]
+    return toeplitz(column, row)
 
-    # Align peak for Toeplitz construction
-    shifted_kernel = np.fft.fftshift(kernel)
-    
-    # Construct Toeplitz matrix using the first row as defined in the image
-    # first_row = shifted_kernel[np.append(0, np.arange(n-1, 0, -1))]
-    A_kernel = toeplitz(shifted_kernel)
+def worker_unpack(args):
+    return runner(*args)
 
-    return torch.tensor(A_kernel, dtype=torch.float32)
+def task_generator(A_matrix):
+    rng = np.random.default_rng(MASTER_SEED)
+    all_seeds = rng.integers(0, int(1e8), size=TOTAL_TRIALS)
 
-def worker(p):
-    return solve_task(**p)
+    for alpha in ALPHA_VALS:
+        for c in C_VALS:
+            for opt in OPTIMIZERS:
+                for lr in LR_VALS:
+                    for i in range(0, TOTAL_TRIALS, BATCH_SIZE):
+                        yield (opt, all_seeds[i:i+BATCH_SIZE], A_matrix, alpha, c, MAX_ITERS, lr)
 
-def main(out_dir):
-    out_dir = Path(out_dir) 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    
-    tasks = []
-    ns = [10, 50, 100, 200]
-    alphas = [1.0, 5.0, 10.0, 20.0]
-    cs = [0.2, 0.5, 0.8, 0.95]
-    lrs = [0.001, 0.005, 0.01]
-    iters_list = [500, 1000]
-    
-    # Reduced seeds for high-core efficiency while maintaining statistical significance
-    op_seeds = range(2)  
-    sig_seeds = range(10)   
-
-    print("Generating task grid with Gaussian Toeplitz A...")
-    for n in ns:
-        # A is fixed for a given N and kernel (sigma=50)
-        A_shared = get_gaussian_toeplitz(n)
-        
-        for ss in sig_seeds:
-            torch.manual_seed(ss + 1000)
-            x_fixed = torch.rand(n)
-            
-            for alpha, c, lr, iters in itertools.product(alphas, cs, lrs, iters_list):
-                tasks.append({
-                    'A': A_shared, 'x_true': x_fixed, 'n': n,
-                    'alpha': alpha, 'c': c, 'lr': lr, 'iters': iters,
-                    'seed': ss, 'algo': 'gd'
-                })
-
-    results = []
-    with Pool(cpu_count()) as p:
-        # imap_unordered returns results as soon as they are ready
-        for res in tqdm(p.imap_unordered(worker, tasks), total=len(tasks)):
-            results.append(res)
-    
-    df = pd.DataFrame(results)
-    df['mse'] = df['loss'] / df['n']
-    df.to_csv(out_dir / "raw_data.csv", index=False)
-
-    # --- ANALYSIS & PLOTTING ---
-    default_n, default_alpha, default_c = 100, 10.0, 0.5
-    default_lr, default_iters = 0.005, 500
-
-    plot_configs = [
-        {'var': 'alpha', 'fix': {'n': default_n, 'c': default_c, 'lr': default_lr, 'iters': default_iters}, 'color': 'blue'},
-        {'var': 'c',     'fix': {'n': default_n, 'alpha': default_alpha, 'lr': default_lr, 'iters': default_iters}, 'color': 'green'},
-        {'var': 'n',     'fix': {'alpha': default_alpha, 'c': default_c, 'lr': default_lr, 'iters': default_iters}, 'color': 'red'},
-        {'var': 'lr',    'fix': {'n': default_n, 'alpha': default_alpha, 'c': default_c, 'iters': default_iters}, 'color': 'purple'},
-        {'var': 'iters', 'fix': {'n': default_n, 'alpha': default_alpha, 'c': default_c, 'lr': default_lr}, 'color': 'orange'}
-    ]   
-    friendly_names = {
-            'alpha': 'Stiffness (α)',
-            'c': 'Threshold (c)',
-            'n': 'Input Dimension (N)',
-            'lr': 'Learning Rate (η)',
-            'iters': 'Iterations'
-        }
-    defaults = {'n': 100, 'alpha': 10.0, 'c': 0.5, 'lr': 0.005, 'iters': 500}
-    for cfg in plot_configs:
-        v = cfg['var']
-        # Filter data where all other variables are at their default value
-        query_parts = [f"{k} == {val}" for k, val in defaults.items() if k != v]
-        subset = df.query(" & ".join(query_parts))
-        
-        if subset.empty:
-            print(f"Skipping {v}: No data found for specified defaults.")
-            continue
-
-        # Group by the independent variable and average over seeds
-        avg = subset.groupby(v).mean(numeric_only=True).reset_index()
-        
-        # Create a clean string of what is fixed for the subtitle
-        fixed_desc = ", ".join([f"{friendly_names[k]}={val}" for k, val in defaults.items() if k != v])
-
-        # Initialize Plot
-        fig, ax1 = plt.subplots(figsize=(10, 6))
-        
-        # 1. MSE Plot (Primary Y-axis)
-        color_mse = cfg['color']
-        lns1 = ax1.plot(avg[v], avg['mse'], marker='o', markersize=8, color=color_mse, 
-                        linewidth=2, label='Mean Squared Error (MSE)')
-        ax1.set_xlabel(friendly_names.get(v, v), fontsize=12, fontweight='bold')
-        ax1.set_ylabel('Reconstruction MSE', fontsize=12, color=color_mse, fontweight='bold')
-        ax1.tick_params(axis='y', labelcolor=color_mse)
-        
-        # Data Labels for MSE
-        for x, y in zip(avg[v], avg['mse']):
-            ax1.annotate(f'{y:.4f}', (x, y), textcoords="offset points", xytext=(0,10), 
-                        ha='center', fontsize=9, color=color_mse, fontweight='bold')
-
-        # 2. Time Plot (Secondary Y-axis)
-        ax2 = ax1.twinx()
-        color_time = 'dimgray'
-        lns2 = ax2.plot(avg[v], avg['time'], marker='s', markersize=6, color=color_time, 
-                        linestyle='--', alpha=0.7, label='Execution Time (s)')
-        ax2.set_ylabel('Time (seconds)', fontsize=12, color=color_time, fontweight='bold')
-        ax2.tick_params(axis='y', labelcolor=color_time)
-
-        # Formatting
-        if v == 'lr': ax1.set_xscale('log')
-        plt.title(f"Optimization Performance vs {friendly_names.get(v, v)}\n"
-                f"Fixed: {fixed_desc}", fontsize=13, pad=20)
-        
-        ax1.grid(True, which="both", ls="-", alpha=0.15)
-        
-        # Combined Legend
-        lns = lns1 + lns2
-        labs = [l.get_label() for l in lns]
-        ax1.legend(lns, labs, loc='upper center', bbox_to_anchor=(0.5, -0.12), ncol=2)
-
-        plt.tight_layout()
-        plt.savefig(out_dir / f"analysis_{v}.png", dpi=300)
-        plt.close()
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dir', type=str, default='ece_results')
-    args = parser.parse_args()
-    main(out_dir=args.dir)
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    stats = {}
+    print("Running Legacy-Compatible Simulation...")
+
+    A_matrix = generate_A(N, K)
+    total_tasks = len(ALPHA_VALS) * len(C_VALS) * len(OPTIMIZERS) * len(LR_VALS) * (TOTAL_TRIALS // BATCH_SIZE)
+    wall_start = time.perf_counter()
+
+    try:
+        with Pool(processes=31) as pool:
+            iterator = pool.imap_unordered(worker_unpack, task_generator(A_matrix))
+            for batch in tqdm(iterator, total=total_tasks, desc="Simulating", unit="batch"):
+                key = (batch['optimizer_name'], batch['alpha'], batch['c_val'], batch['lr'])
+
+                if key not in stats:
+                    stats[key] = {'n': 0, 'avg_err': 0.0, 'avg_time': 0.0}
+
+                s = stats[key]
+                m = batch['n']
+                n = s['n']
+                new_n = n + m
+
+                s['avg_err'] = (s['avg_err'] * n + batch['sum_err']) / new_n
+                s['avg_time'] = (s['avg_time'] * n + batch['sum_time']) / new_n
+                s['n'] = new_n
+
+    except KeyboardInterrupt:
+        print("\nSimulation interrupted. Cleaning up...")
+
+    wall_end = time.perf_counter()
+
+    print("\n" + "="*100)
+    print(f"{'Optimizer':<15} | {'Alpha':<6} | {'C':<5} | {'LR':<6} | {'Avg MSE':<15} | {'Avg Time (ms)':<15}")
+    print("-" * 100)
+    for key in sorted(stats.keys()):
+        d = stats[key]
+        print(f"{key[0]:<15} | {key[1]:<6.1f} | {key[2]:<5.1f} | {key[3]:<6.4f} | {d['avg_err']:<15.4f} | {d['avg_time']/1e6:<15.2f}")
+    print("="*100)
+    print(f"\nTotal wall time: {wall_end - wall_start:.2f}s")

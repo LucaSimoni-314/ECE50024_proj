@@ -7,7 +7,7 @@ from scipy.linalg import toeplitz,circulant
 # ==========================================
 # 1. Setup Directory and Constants
 # ==========================================
-output_folder = "alpha_comparison_plots/all"
+output_folder = "test/"
 if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
@@ -55,7 +55,6 @@ for alpha_val in alpha_values:
         args = (y_target, A_matrix, alpha_val, c_val)
 
         opts = {
-                # "Standard GD": StandardGD(start_pt, *args, learning_rate=0.1),
                 "Projected GD": ProjectedGD(start_pt, *args, learning_rate=0.05),
                 "Nesterov": NesterovMomentum(start_pt, *args, learning_rate=0.05, momentum=0.05),
                 "Stochastic GD": StochasticGD(start_pt, *args, learning_rate=0.05, batch_size=1),

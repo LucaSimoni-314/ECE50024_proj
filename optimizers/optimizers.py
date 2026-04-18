@@ -29,7 +29,7 @@ class Optimizer:
         # 4. Derivative of h_z w.r.t z
         h_prime_z = self.alpha_param * h_z * (1 - h_z)
         # 5. Chain rule gradient
-        grad = -2 * self.A.T @ (residual * h_prime_z)
+        grad =      self.A.T @ (residual * h_prime_z)
         return grad
 
     def objective_fn(self, x_val):
@@ -63,12 +63,13 @@ class ProjectedGD(Optimizer):
 
 # --- 3. Stochastic Gradient Descent ---
 class StochasticGD(Optimizer):
-    def __init__(self, x_init, y, A, alpha_param, c_param, learning_rate=0.01, batch_size=32):
+    def __init__(self, x_init, y, A, alpha_param, c_param, learning_rate=0.01, batch_size=50):
         super().__init__(x_init, y, A, alpha_param, c_param)
         self.lr = learning_rate
         self.batch_size = batch_size
 
     def step(self):
+        self.batch_size = min(self.batch_size, len(self.y) - 1)
         # Sample a subset of the rows in A and y
         indices = np.random.choice(len(self.y), self.batch_size, replace=False)
         A_batch = self.A[indices]
@@ -93,7 +94,7 @@ class NesterovMomentum(Optimizer):
 
     def step(self):
         # Lookahead
-        x_lookahead = self.x + self.mu * self.v
+        x_lookahead = self.project(self.x + self.mu * self.v)
         grad = self.compute_gradient(x_lookahead)
         
         # Update velocity and project position
@@ -107,17 +108,23 @@ class LBFGSOptimizer(Optimizer):
         super().__init__(x_init, y, A, alpha_param, c_param)
 
     def run(self):
-        # Scipy's L-BFGS-B handles projection via the 'bounds' parameter
+        # We add 'options' to prevent the optimizer from hanging on flat gradients
         res = minimize(
             fun=self.objective_fn,
             x0=self.x,
             jac=self.compute_gradient,
             method='L-BFGS-B',
-            bounds=[self.bounds] * len(self.x)
+            # Ensure these bounds allow enough range (e.g., -10 to 10)
+            bounds=[self.bounds] * len(self.x),
+            options={
+                'maxiter': 500,     # Cap iterations; for N=100, 500 is plenty
+                'ftol': 1e-7,       # Exit if the improvement is negligible
+                'maxfun': 1000      # Cap total function evaluations
+            }
         )
         self.x = res.x
         return self.x
-    
+
 class HypergradientDescent(Optimizer):
     def __init__(self, x_init, y, A, alpha_param, c_param, initial_lr=0.01, hyper_lr=1e-4):
         super().__init__(x_init, y, A, alpha_param, c_param)
@@ -136,7 +143,7 @@ class HypergradientDescent(Optimizer):
         self.lr = self.lr + self.beta * h_grad
         
         # Guard against negative learning rates
-        self.lr = max(self.lr, 1e-6)
+        self.lr = np.clip(self.lr, 0.0001, 1.0)
 
         # 3. Standard update step
         self.x = self.project(self.x - self.lr * grad)
